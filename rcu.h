@@ -28,10 +28,7 @@ extern "C" {
     #define rcu_read_lock(idp) do { \
         ++ddref(idp, 1); \
         if (ddref(idp, 1) == 1) { \
-            ++ddref(idp, 2); \
-            if (ddref(idp, 2) == 1 || ddref(idp, 2) == 0) { \
-                ddref(idp, 2) = 2; \
-            } \
+            ddref(idp, 2) += 2; \
             ddref(idp, 0) = ddref(idp, 2); \
             smp_mb(); \
         } \
