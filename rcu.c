@@ -163,7 +163,7 @@ int rcu_thread_init(struct rcu* rcu, int* (*idp) [3])
 
 int call_rcu(struct rcu* rcu, void (* cb) (void* any), void* any)
 {
-    struct rcu_wait_queue* wait = malloc(sizeof(struct rcu_wait_queue));
+    struct rcu_wait_queue* wait = (struct rcu_wait_queue *) malloc(sizeof(struct rcu_wait_queue));
     if (wait == NULL) {
         return -1;
     }
