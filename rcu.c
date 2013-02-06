@@ -1,169 +1,227 @@
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include <semaphore.h>
+#include <sched.h>
+#include "lock.h"
+#include "rcu.h"
 
+struct rcu_wait_queue {
+    struct list_head entry;
+    void* any;
+    void (*task) (void* any);
+    int* intp;
+};
 
-#include"buddy.h"
-#include<assert.h>
+static int lck = 0;
+static pthread_t tid = 0;
+static struct list_head head;
 
-#define _XOPEN_SOURCE 600
-#define _GNU_SOURCE
-#include<stdlib.h>
+#define read_done(stat, snap, nr) \
+({ \
+    int done = 1; \
+    for (unsigned int i = 0; i < nr; ++i) { \
+        if (stat[i] == snap[i] && stat[i] != 1 && stat[i] != 0) { \
+            done = 0; \
+            break; \
+        } \
+    } \
+    done; \
+})
 
-#define IS_POWER_OF_2(x) (!((x) & ((x) - 1)))
-#define LEFT_LEAF(index) ((index) * 2 + 1)
-#define RIGHT_LEAF(index) ((index) * 2 + 2)
-#define PARENT(index) (((index) + 1) / 2 - 1)
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-
-static unsigned char next_order_of_2(int size)
+static void wakeup(struct rcu* rcu)
 {
-    unsigned char order = 0;
-    while ((1 << order) < size) {
-        order++;
-    }
-    return order;
-}
+    lock(&rcu->lck);
+    for (struct list_head* ent = rcu->sync.next; ent != &rcu->sync;) {
+        struct rcu_wait_queue* wait = list_entry(ent, struct rcu_wait_queue, entry);
+        ent = ent->next;
+        unlock(&rcu->lck);
+        
+        int wake = read_done(rcu->tlsp, wait->intp, rcu->nr);
 
-struct buddy_pool* buddy_create(unsigned int order, unsigned int min_order)
-{
-    struct buddy_pool* self = NULL;
-    if (order >= 64 || min_order >= order ||
-        NULL == (self = malloc(sizeof(struct buddy_pool))))
-    {
-        goto malloc_self_failed;
-    }
-
-    self->order = order;
-    self->min_order = min_order;
-    self->pool_size = 1 << (order);
-    int bh_num = (1 << (order - self->min_order)) * 2 - 1;
-
-    int ret = posix_memalign((void **)&(self->bh), 4096, bh_num);
-    if (ret < 0) {
-        goto malloc_bh_failed;
-    }
-
-    ret = posix_memalign((void **)&(self->buffer), 4096, self->pool_size);
-    if (ret < 0) {
-        goto malloc_buffer_failed;
-    }
-
-    int current_order = order + 1;
-    for (int i = 0; i < bh_num; i++) {
-        if (IS_POWER_OF_2(i + 1)) {
-            current_order--;
+        lock(&rcu->lck);
+        if (wake == 1) {
+            list_del(&wait->entry);
+            wait->task(wait->any);
         }
-        self->bh[i] = current_order;
     }
-    return self;
+    unlock(&rcu->lck);
 
-malloc_buffer_failed:
-    free(self->bh);
-malloc_bh_failed:
-    free(self);
-malloc_self_failed:
-    return (struct buddy_pool *) (-1);
+    int wake = read_done(rcu->tlsp, rcu->intp, rcu->nr);
+    if (wake == 1) {
+        while (!list_empty(&rcu->async)) {
+            struct list_head* ent = rcu->async.next;
+            list_del(ent);
+            struct rcu_wait_queue* wait = list_entry(ent, struct rcu_wait_queue, entry);
+            wait->task(wait->any);
+            free(wait);
+        }
+    }
+
+    if (list_empty(&rcu->async)) {
+        lock(&rcu->lck);
+        if (!list_empty(&rcu->nxtlist)) {
+            memcpy(rcu->intp, rcu->tlsp, rcu->nr * sizeof(int));
+            list_add(&rcu->async, &rcu->nxtlist);
+            list_del_init(&rcu->nxtlist);
+        }
+        unlock(&rcu->lck);
+    }
 }
 
-void buddy_destroy(struct buddy_pool* self)
+static void* rcu_daemon(void* any)
 {
-    assert(self != NULL);
-    assert(self->bh != NULL);
-    assert(self->buffer != NULL);
-    free(self->buffer);
-    free(self->bh);
-    free(self);
+    (void) any;
 
+    while (1) {
+        lock(&lck);
+        struct list_head* ent = head.next;
+        if (ent == &head) {
+            tid = 0;
+            unlock(&lck);
+            break;
+        }
+        unlock(&lck);
+
+        for (; ent != &head;) {
+            struct rcu* rcu = list_entry(ent, struct rcu, entry);
+            ent = ent->next;
+            if (rcu->zombie == 1) {
+                lock(&lck);
+                list_del(&rcu->entry);
+                unlock(&lck);
+                free(rcu);
+            } else {
+                wakeup(rcu);
+            }
+        }
+        sched_yield();
+    }
+    return NULL;
 }
 
-char* buddy_malloc(struct buddy_pool* self, int size)
+struct rcu* rcu_alloc(unsigned int rd_max)
 {
-    char* ret_ptr = NULL;
-    if (size <= 0) {
+    if (rd_max < 1) {
         return NULL;
     }
 
-    unsigned char order = next_order_of_2(size);
-    if (order < self->min_order) {
-        order = self->min_order;
-    }
-
-    int index = 0;
-    if (self->bh[0] < order) {
+    size_t bytes = sizeof(int) * (rd_max * 4);
+    struct rcu* rcu = (struct rcu*) malloc(sizeof(struct rcu) + bytes);
+    if (rcu == NULL) {
         return NULL;
     }
 
-    int current_order = self->order;
-    for (current_order = self->order; current_order != order; current_order--) {
-        if (self->bh[LEFT_LEAF(index)] >= order) {
-            index = LEFT_LEAF(index);
+    rcu->zombie = 0;
+    rcu->nr = rd_max;
+    rcu->tlsp = (int *) (rcu + 1);
+    rcu->refp = rcu->tlsp + rd_max;
+    rcu->intp = rcu->refp + rd_max;
+    rcu->tckp = rcu->intp + rd_max;
+    memset(rcu->tlsp, 0, bytes);
+    INIT_LIST_HEAD(&rcu->async);
+    INIT_LIST_HEAD(&rcu->sync);
+    INIT_LIST_HEAD(&rcu->nxtlist);
+
+    lock(&lck);
+    list_add(&rcu->entry, &head);
+    if (tid == 0) {
+        if(0 != pthread_create(&tid, NULL, rcu_daemon, NULL)) {
+            tid = 0;
+            free(rcu);
+            rcu = NULL;
         } else {
-            index = RIGHT_LEAF(index);
+            pthread_detach(tid);
         }
     }
+    unlock(&lck);
 
-    self->bh[index] = 0;
-    ret_ptr = self->buffer + (index + 1) * (1 << order) - (self->pool_size);
-    while (index) {
-        index = PARENT(index);
-        self->bh[index] = MAX(self->bh[LEFT_LEAF(index)], self->bh[RIGHT_LEAF(index)]);
-    }
-
-    return ret_ptr;
+    return rcu;
 }
 
-void buddy_free(struct buddy_pool* self, char* pointer)
+int rcu_thread_init(struct rcu* rcu, int* (*idp) [3])
 {
-    assert(self != NULL && self->bh != NULL &&self->buffer != NULL && pointer != NULL);
-    int offset = pointer - self->buffer;
-    assert(offset >= 0 && offset < self->pool_size);
+    int n = -1;
+    if (rcu == NULL || idp == NULL) {
+        return -1;
+    }
 
-    int current_order = self->min_order;
-    int current_index = 0;
-    int found = 0;
-    unsigned char left_order, right_order;
-
-    while (offset % (1 << current_order) == 0) {
-        current_index = (1 << (self->order - current_order)) - 1 + offset / (1 << current_order);
-        if (self->bh[current_index] == 0) {
-            found = 1;
+    lock(&rcu->lck);
+    for (unsigned int i = 0; i < rcu->nr; ++i) {
+        if (rcu->tlsp[i] == 0) {
+            rcu->tlsp[i] = 1;
+            (*idp)[0] = &rcu->tlsp[i];
+            (*idp)[1] = &rcu->refp[i];
+            (*idp)[2] = &rcu->tckp[i];
+            n = 0;
             break;
         }
-        current_order++;
     }
-    assert(found == 1);
-
-    self->bh[current_index] = current_order;
-    while (current_index) {
-        current_index = PARENT(current_index);
-        current_order++;
-
-        left_order = self->bh[LEFT_LEAF(current_index)];
-        right_order = self->bh[RIGHT_LEAF(current_index)];
-        if (left_order == (current_order - 1) && right_order == (current_order - 1)) {
-            self->bh[current_index] = current_order;
-        } else {
-            self->bh[current_index] = MAX(left_order, right_order);
-        }
-    }
+    unlock(&rcu->lck);
+    return n;
 }
 
-int buddy_size(struct buddy_pool* self, char* pointer) {
-    assert(self != NULL && self->bh != NULL && self->buffer != NULL && pointer != NULL);
-    int offset = pointer - self->buffer;
-    assert(offset >= 0 && offset < self->pool_size);
+int call_rcu(struct rcu* rcu, void (* cb) (void* any), void* any)
+{
+    struct rcu_wait_queue* wait = malloc(sizeof(struct rcu_wait_queue));
+    if (wait == NULL) {
+        return -1;
+    }
 
-    int current_order = self->min_order;
-    int current_index = 0;
-    int found = 0;
+    INIT_LIST_HEAD(&wait->entry);
+    wait->intp = NULL;
+    wait->task = cb;
+    wait->any = any;
 
-    while (offset % (1 << current_order) == 0) {
-        current_index = (1 << (self->order - current_order)) - 1 + offset / (1 << current_order);
-        if (self->bh[current_index] == 0) {
-            found = 1;
-            break;
-        }
-        current_order++;
-    } 
-    
-    assert(found == 1);
-    return (1 << current_order);
+    lock(&rcu->lck);
+    list_add(&wait->entry, &rcu->nxtlist);
+    unlock(&rcu->lck);
+    return 0;
+}
+
+static void semup(void* any)
+{
+    sem_t* sem = (sem_t *) any;
+    sem_post(sem);
+}
+
+int synchronize_rcu(struct rcu* rcu)
+{
+    struct rcu_wait_queue wait = {
+        .entry = LIST_HEAD_INIT(wait.entry),
+        .intp = NULL,
+        .task = semup,
+    };
+
+    size_t bytes = sizeof(int) * rcu->nr;
+    wait.intp = (int *) malloc(bytes);
+    if (wait.intp == NULL) {
+        return -1;
+    }
+
+    smp_rmb();
+    memcpy(wait.intp, rcu->tlsp, sizeof(int) * rcu->nr);
+
+    int wake = read_done(rcu->tlsp, wait.intp, rcu->nr);
+    if (wake == 1) {
+        free(wait.intp);
+        return 0;
+    }
+
+    sem_t sem;
+    if (0 != sem_init(&sem, 0, 0)) {
+        free(wait.intp);
+        return -1;
+    }
+    wait.any = (void *) &sem;
+
+    lock(&rcu->lck);
+    list_add(&wait.entry, &rcu->sync);
+    unlock(&rcu->lck);
+
+    sem_wait(&sem);
+    free(wait.intp);
+    sem_destroy(&sem);
+
+    return 0;
 }
