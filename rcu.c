@@ -17,11 +17,11 @@ static int lck = 0;
 static pthread_t tid = 0;
 static struct list_head head;
 
-#define read_done(stat, snap, nr) \
+#define read_done(stat, snap, nr, refp) \
 ({ \
     int done = 1; \
     for (unsigned int i = 0; i < nr; ++i) { \
-        if (stat[i] == snap[i] && stat[i] != 1 && stat[i] != 0) { \
+        if (stat[i] == snap[i] && refp[i] != 0) { \
             done = 0; \
             break; \
         } \
@@ -37,7 +37,7 @@ static void wakeup(struct rcu* rcu)
         ent = ent->next;
         unlock(&rcu->lck);
         
-        int wake = read_done(rcu->tlsp, wait->intp, rcu->nr);
+        int wake = read_done(rcu->tlsp, wait->intp, rcu->nr, rcu->refp);
 
         lock(&rcu->lck);
         if (wake == 1) {
@@ -47,7 +47,7 @@ static void wakeup(struct rcu* rcu)
     }
     unlock(&rcu->lck);
 
-    int wake = read_done(rcu->tlsp, rcu->intp, rcu->nr);
+    int wake = read_done(rcu->tlsp, rcu->intp, rcu->nr, rcu->refp);
     if (wake == 1) {
         while (!list_empty(&rcu->async)) {
             struct list_head* ent = rcu->async.next;
@@ -199,10 +199,10 @@ int synchronize_rcu(struct rcu* rcu)
         return -1;
     }
 
-    smp_rmb();
+    smp_mb();
     memcpy(wait.intp, rcu->tlsp, sizeof(int) * rcu->nr);
 
-    int wake = read_done(rcu->tlsp, wait.intp, rcu->nr);
+    int wake = read_done(rcu->tlsp, wait.intp, rcu->nr, rcu->refp);
     if (wake == 1) {
         free(wait.intp);
         return 0;
